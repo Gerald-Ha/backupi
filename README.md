@@ -1,4 +1,5 @@
 # backupi
+<img src="https://github.com/user-attachments/assets/26c2aa65-1a07-45f2-8010-cef27f6b16f0" width="448" height="auto">
 
 `backupi` is a small interactive backup and restore helper for Linux desktop
 systems. It is meant for the things that classic personal-file backups often

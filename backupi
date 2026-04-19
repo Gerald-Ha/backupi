@@ -1,0 +1,1517 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BACKUPI_VERSION="${BACKUPI_VERSION:-1.0.1}"
+BACKUPI_PROJECT="backupi"
+BACKUPI_DEVELOPER="Gerald-H"
+BACKUPI_GITHUB="https://github.com/Gerald-Ha"
+BACKUPI_UPDATE_API_KEY_DEFAULT="upd_dba95b5c8b260809706646542f0965f2d104c47d9c7ce6d4ed5dd17bb84ab81f"
+CONFIG_FILE="${BACKUPI_CONFIG:-/etc/backupi/backupi.conf}"
+DRY_RUN=0
+COMMAND="menu"
+ACTIVE_USER="${SUDO_USER:-${USER:-}}"
+RSYNC_EXCLUDE_ARGS=()
+UPDATE_STATUS_KIND="not_checked"
+UPDATE_STATUS_LINE="Update status: not checked"
+
+if [[ ${EUID:-$(id -u)} -eq 0 && -n ${SUDO_USER:-} ]]; then
+  sudo_home="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+  if [[ -n "$sudo_home" ]]; then
+    export HOME="$sudo_home"
+  fi
+fi
+
+usage() {
+  cat <<EOF
+backupi - Fedora backup and restore helper
+
+Project: $BACKUPI_PROJECT
+Developer: $BACKUPI_DEVELOPER
+GitHub: $BACKUPI_GITHUB
+
+Usage:
+  backupi                  Open interactive menu
+  backupi --backup         Run backup for all configured entries
+  backupi --backup-detected
+                            Run backup for entries available on this system
+  backupi --check-updates  Check update center for new backupi releases
+  backupi --restore-safe   Restore the recommended safe user entries
+  backupi --restore-packages
+                            Restore DNF packages and Flatpak apps
+  backupi --restore-backupi-config
+                            Restore backupi.conf from the selected backup root
+  backupi --system-info    Show detected OS, package managers and desktops
+  backupi --list           Show configured entries
+  backupi --edit-config    Edit sources, backup paths and restore targets
+  backupi --set-backup-root DIR
+                            Set the backup destination directory in config
+  backupi --set-snapshot-retention N
+                            Keep the latest N snapshots, default is 5
+  backupi --config FILE    Use another config file
+  backupi --dry-run        Print actions without copying/installing
+  backupi --version        Show backupi version
+  backupi --credits        Show project credits
+
+Config:
+  /etc/backupi/backupi.conf
+  /etc/backupi/update.conf
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'Warning: %s\n' "$*" >&2
+}
+
+setup_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+  else
+    C_RED=''
+    C_GREEN=''
+    C_YELLOW=''
+    C_BLUE=''
+    C_BOLD=''
+    C_RESET=''
+  fi
+}
+
+display_value() {
+  local value="${1:-}"
+  if [[ -n "${value//[[:space:]]/}" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '(not set)\n'
+  fi
+}
+
+print_credits() {
+  printf '%s %s\n' "$BACKUPI_PROJECT" "$BACKUPI_VERSION"
+  printf 'Developer: %s\n' "$BACKUPI_DEVELOPER"
+  printf 'GitHub: %s\n' "$BACKUPI_GITHUB"
+  printf 'Project: %s\n' "$BACKUPI_PROJECT"
+}
+
+set_update_status() {
+  UPDATE_STATUS_KIND="$1"
+  UPDATE_STATUS_LINE="$2"
+}
+
+print_update_status_line() {
+  case "$UPDATE_STATUS_KIND" in
+    ok) printf '%s%s%s\n' "$C_GREEN" "$UPDATE_STATUS_LINE" "$C_RESET" ;;
+    update|blocked) printf '%s%s%s\n' "$C_RED" "$UPDATE_STATUS_LINE" "$C_RESET" ;;
+    warning) printf '%s%s%s\n' "$C_YELLOW" "$UPDATE_STATUS_LINE" "$C_RESET" ;;
+    *) printf '%s\n' "$UPDATE_STATUS_LINE" ;;
+  esac
+}
+
+pause() {
+  [[ -t 0 ]] || return 0
+  printf '\nPress Enter to continue...'
+  read -r _
+}
+
+yes_no() {
+  local prompt="$1"
+  local default="${2:-n}"
+  local answer suffix
+
+  if [[ "$default" == "y" ]]; then
+    suffix='[Y/n]'
+  else
+    suffix='[y/N]'
+  fi
+
+  if [[ ! -t 0 ]]; then
+    [[ "$default" == "y" ]]
+    return
+  fi
+
+  while true; do
+    printf '%s %s ' "$prompt" "$suffix"
+    read -r answer
+    answer="${answer,,}"
+    [[ -z "$answer" ]] && answer="$default"
+    case "$answer" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+    esac
+  done
+}
+
+run_cmd() {
+  if (( DRY_RUN )); then
+    printf '[dry-run]'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+  "$@"
+}
+
+as_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    run_cmd "$@"
+  else
+    run_cmd sudo "$@"
+  fi
+}
+
+path_needs_root() {
+  local path="$1"
+  [[ "$path" == /etc || "$path" == /etc/* || "$path" == /usr || "$path" == /usr/* ]]
+}
+
+expand_user_path() {
+  local path="$1"
+  case "$path" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${path#~/}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+config_bool_enabled() {
+  case "${1,,}" in
+    1|true|yes|y|on|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+backup_current_root() {
+  [[ -n "${BACKUP_ROOT//[[:space:]]/}" ]] || return 0
+  if config_bool_enabled "${BACKUP_USE_CURRENT_DIR:-true}"; then
+    printf '%s/%s\n' "$BACKUP_ROOT" "${BACKUP_CURRENT_DIRNAME:-current}"
+  else
+    printf '%s\n' "$BACKUP_ROOT"
+  fi
+}
+
+snapshot_parent_root() {
+  [[ -n "${BACKUP_ROOT//[[:space:]]/}" ]] || return 0
+  printf '%s/%s\n' "$BACKUP_ROOT" "${BACKUP_SNAPSHOT_DIRNAME:-snapshots}"
+}
+
+default_restore_root() {
+  local current
+  [[ -n "${BACKUP_ROOT//[[:space:]]/}" ]] || return 0
+  current="$(backup_current_root)"
+  if [[ -d "$current" ]]; then
+    printf '%s\n' "$current"
+  else
+    printf '%s\n' "$BACKUP_ROOT"
+  fi
+}
+
+backup_root_value_validation_error() {
+  local value="$1"
+  local compact
+  compact="${value//[[:space:]]/}"
+
+  if [[ -z "$compact" ]]; then
+    printf 'BACKUP_ROOT is empty. Set a backup destination before running backupi.\n'
+    return 0
+  fi
+  if [[ "$value" != /* ]]; then
+    printf 'BACKUP_ROOT must be an absolute path: %s\n' "$value"
+    return 0
+  fi
+
+  case "$value" in
+    /|/bin|/boot|/dev|/etc|/home|/proc|/root|/run|/sbin|/sys|/usr|/var)
+      printf 'BACKUP_ROOT points to a system directory and is refused: %s\n' "$value"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+backup_root_validation_error() {
+  backup_root_value_validation_error "$BACKUP_ROOT"
+}
+
+validate_backup_root() {
+  local error
+  if error="$(backup_root_validation_error)"; then
+    die "$error"
+  fi
+}
+
+backup_root_is_valid() {
+  ! backup_root_validation_error >/dev/null
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || die "Config file not found or not readable: $CONFIG_FILE"
+  # shellcheck source=/etc/backupi/backupi.conf
+  source "$CONFIG_FILE"
+
+  [[ -n "${BACKUP_ROOT+x}" ]] || die "BACKUP_ROOT is not set in $CONFIG_FILE"
+  declare -p BACKUPI_ITEMS >/dev/null 2>&1 || die "BACKUPI_ITEMS is not set in $CONFIG_FILE"
+  if ! declare -p BACKUPI_EXCLUDES >/dev/null 2>&1; then
+    BACKUPI_EXCLUDES=()
+  fi
+  if ! declare -p BACKUPI_ITEM_EXCLUDES >/dev/null 2>&1; then
+    BACKUPI_ITEM_EXCLUDES=()
+  fi
+  BACKUP_RSYNC_DELETE="${BACKUP_RSYNC_DELETE:-false}"
+  BACKUP_RSYNC_DELETE_EXCLUDED="${BACKUP_RSYNC_DELETE_EXCLUDED:-true}"
+  BACKUP_BEFORE_RESTORE="${BACKUP_BEFORE_RESTORE:-true}"
+  BACKUP_USE_CURRENT_DIR="${BACKUP_USE_CURRENT_DIR:-true}"
+  BACKUP_CURRENT_DIRNAME="${BACKUP_CURRENT_DIRNAME:-current}"
+  BACKUP_SNAPSHOTS_ENABLED="${BACKUP_SNAPSHOTS_ENABLED:-true}"
+  BACKUP_SNAPSHOT_DIRNAME="${BACKUP_SNAPSHOT_DIRNAME:-snapshots}"
+  BACKUP_SNAPSHOT_RETENTION="${BACKUP_SNAPSHOT_RETENTION:-5}"
+  BACKUPI_SELF_CONFIG_BACKUP_PATH="${BACKUPI_SELF_CONFIG_BACKUP_PATH:-backupi/backupi.conf}"
+  [[ "$BACKUP_SNAPSHOT_RETENTION" =~ ^[0-9]+$ ]] || die "BACKUP_SNAPSHOT_RETENTION must be a number"
+  case "$BACKUPI_SELF_CONFIG_BACKUP_PATH" in
+    ""|/*|../*|*/../*|*/..)
+      die "BACKUPI_SELF_CONFIG_BACKUP_PATH must be a relative path inside the backup root"
+      ;;
+  esac
+
+  CURRENT_ROOT="$(backup_current_root)"
+  SNAPSHOT_PARENT="$(snapshot_parent_root)"
+  RESTORE_SOURCE_ROOT="${RESTORE_SOURCE_ROOT:-$(default_restore_root)}"
+}
+
+load_update_config() {
+  UPDATE_CONFIG_FILE="${BACKUPI_UPDATE_CONFIG:-/etc/backupi/update.conf}"
+
+  if [[ -r "$UPDATE_CONFIG_FILE" ]]; then
+    # shellcheck source=/etc/backupi/update.conf
+    source "$UPDATE_CONFIG_FILE"
+  fi
+
+  UPDATE_SERVER_URL="${UPDATE_SERVER_URL:-https://update.gerald-hasani.com}"
+  UPDATE_PROJECT_ID="${UPDATE_PROJECT_ID:-backupi}"
+  UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
+  UPDATE_API_KEY="${UPDATE_API_KEY:-$BACKUPI_UPDATE_API_KEY_DEFAULT}"
+  APP_VERSION="${APP_VERSION:-$BACKUPI_VERSION}"
+  UPDATE_CHECK_ON_START="${UPDATE_CHECK_ON_START:-true}"
+  UPDATE_CHECK_TIMEOUT="${UPDATE_CHECK_TIMEOUT:-5}"
+  UPDATE_INSTANCE_ID_FILE="${UPDATE_INSTANCE_ID_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/backupi/instance-id}"
+}
+
+parse_item() {
+  local raw="$1"
+  IFS='|' read -r ITEM_KIND ITEM_ID ITEM_CATEGORY ITEM_GROUP ITEM_SOURCE ITEM_BACKUP_PATH ITEM_RESTORE_TARGET ITEM_DESCRIPTION ITEM_SNAPSHOT_POLICY <<<"$raw"
+  ITEM_SNAPSHOT_POLICY="${ITEM_SNAPSHOT_POLICY:-$(default_snapshot_policy)}"
+}
+
+default_snapshot_policy() {
+  case "${ITEM_ID:-}:${ITEM_GROUP:-}" in
+    home-config-all:*|local-share-all:*|local-state-all:*|flatpak-user-data:*|steam:*|lutris:*|umu:*|akonadi:*) printf 'current-only\n' ;;
+    *:broad-home|*:gaming|*:app-data) printf 'current-only\n' ;;
+    *) printf 'snapshot\n' ;;
+  esac
+}
+
+item_is_snapshotted() {
+  case "${ITEM_SNAPSHOT_POLICY,,}" in
+    snapshot|snapshots|history|historical) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_path_item() {
+  case "$1" in
+    file|dir) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_package_item() {
+  case "$1" in
+    dnf-packages|flatpak-apps) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+build_rsync_exclude_args() {
+  RSYNC_EXCLUDE_ARGS=()
+  local pattern scoped item_id item_pattern
+
+  for pattern in "${BACKUPI_EXCLUDES[@]}"; do
+    [[ -n "$pattern" ]] || continue
+    RSYNC_EXCLUDE_ARGS+=(--exclude="$pattern")
+  done
+
+  for scoped in "${BACKUPI_ITEM_EXCLUDES[@]}"; do
+    [[ "$scoped" == *"|"* ]] || continue
+    item_id="${scoped%%|*}"
+    item_pattern="${scoped#*|}"
+    [[ "$item_id" == "$ITEM_ID" && -n "$item_pattern" ]] || continue
+    RSYNC_EXCLUDE_ARGS+=(--exclude="$item_pattern")
+  done
+}
+
+detect_system() {
+  DETECTED_OS_ID="unknown"
+  DETECTED_OS_NAME="Unknown Linux"
+  DETECTED_OS_VERSION=""
+  DETECTED_OS_LIKE=""
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/etc/os-release
+    source /etc/os-release
+    DETECTED_OS_ID="${ID:-unknown}"
+    DETECTED_OS_NAME="${PRETTY_NAME:-${NAME:-Unknown Linux}}"
+    DETECTED_OS_VERSION="${VERSION_ID:-}"
+    DETECTED_OS_LIKE="${ID_LIKE:-}"
+  fi
+
+  DETECTED_PACKAGE_MANAGERS=()
+  local tool
+  for tool in dnf apt flatpak snap rpm dpkg; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      DETECTED_PACKAGE_MANAGERS+=("$tool")
+    fi
+  done
+
+  DETECTED_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-${XDG_SESSION_DESKTOP:-${DESKTOP_SESSION:-unknown}}}"
+  DETECTED_DESKTOP_CONFIGS=()
+  local desktop_probe
+  desktop_probe="${DETECTED_CURRENT_DESKTOP,,}:${XDG_SESSION_DESKTOP:-}:${DESKTOP_SESSION:-}"
+  desktop_probe="${desktop_probe,,}"
+
+  if [[ "$desktop_probe" == *kde* || -e "${HOME}/.config/kdeglobals" || -e "${HOME}/.config/plasmashellrc" ]]; then
+    DETECTED_DESKTOP_CONFIGS+=("KDE Plasma")
+  fi
+  if [[ "$desktop_probe" == *gnome* || -e "${HOME}/.config/dconf/user" || -d "${HOME}/.config/dconf" ]]; then
+    DETECTED_DESKTOP_CONFIGS+=("GNOME")
+  fi
+  if [[ "$desktop_probe" == *xfce* || -d "${HOME}/.config/xfce4" ]]; then
+    DETECTED_DESKTOP_CONFIGS+=("XFCE")
+  fi
+  if [[ "$desktop_probe" == *cinnamon* || -d "${HOME}/.cinnamon" ]]; then
+    DETECTED_DESKTOP_CONFIGS+=("Cinnamon")
+  fi
+  if [[ "$desktop_probe" == *mate* || -d "${HOME}/.config/mate" ]]; then
+    DETECTED_DESKTOP_CONFIGS+=("MATE")
+  fi
+}
+
+join_words() {
+  local word first=1
+  if (($# == 0)); then
+    printf 'none detected\n'
+    return 0
+  fi
+
+  for word in "$@"; do
+    if (( first )); then
+      printf '%s' "$word"
+      first=0
+    else
+      printf ', %s' "$word"
+    fi
+  done
+  printf '\n'
+}
+
+item_matches_detected_system() {
+  case "$ITEM_KIND" in
+    dnf-packages)
+      command -v dnf >/dev/null 2>&1
+      return
+      ;;
+    flatpak-apps)
+      command -v flatpak >/dev/null 2>&1
+      return
+      ;;
+    file|dir)
+      [[ -e "$ITEM_SOURCE" ]]
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+count_detected_items() {
+  local raw count=0
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    parse_item "$raw"
+    if item_matches_detected_system; then
+      ((count++))
+    fi
+  done
+  printf '%s\n' "$count"
+}
+
+json_get() {
+  local filter="$1"
+  local json="$2"
+  jq -r "$filter // empty" <<<"$json" 2>/dev/null || true
+}
+
+generate_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+  fi
+}
+
+get_update_instance_id() {
+  local id
+
+  if [[ -r "$UPDATE_INSTANCE_ID_FILE" ]]; then
+    read -r id < "$UPDATE_INSTANCE_ID_FILE" || true
+    if [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  fi
+
+  id="$(generate_uuid)"
+  if mkdir -p "$(dirname "$UPDATE_INSTANCE_ID_FILE")" 2>/dev/null; then
+    printf '%s\n' "$id" > "$UPDATE_INSTANCE_ID_FILE" 2>/dev/null || true
+    chmod 600 "$UPDATE_INSTANCE_ID_FILE" 2>/dev/null || true
+  fi
+  printf '%s\n' "$id"
+}
+
+build_update_payload() {
+  local instance_id="$1"
+  local os_id="${DETECTED_OS_ID:-unknown}"
+  local version_id="${DETECTED_OS_VERSION:-}"
+  local distro arch
+
+  if [[ -n "$version_id" ]]; then
+    distro="$os_id-$version_id"
+  else
+    distro="$os_id"
+  fi
+  arch="$(uname -m 2>/dev/null || printf 'unknown')"
+
+  jq -n \
+    --arg project_id "$UPDATE_PROJECT_ID" \
+    --arg instance_id "$instance_id" \
+    --arg version "$APP_VERSION" \
+    --arg channel "$UPDATE_CHANNEL" \
+    --arg distro "$distro" \
+    --arg arch "$arch" \
+    '{
+      project: {
+        id: $project_id,
+        instance_id: $instance_id
+      },
+      current: {
+        version: $version
+      },
+      channel: $channel,
+      platform: {
+        os: "linux",
+        distro: $distro,
+        arch: $arch
+      },
+      capabilities: {
+        accept_prerelease: false,
+        supports_delta: false
+      }
+    }'
+}
+
+print_update_result() {
+  local response="$1"
+  local mode="${2:-manual}"
+  local status project_name current_version latest_version minimum_supported critical update_link notes_url message
+
+  status="$(json_get '.status' "$response")"
+  project_name="$(json_get '.project.name' "$response")"
+  current_version="$(json_get '.current.version' "$response")"
+  latest_version="$(json_get '.update.latest_version' "$response")"
+  minimum_supported="$(json_get '.update.minimum_supported' "$response")"
+  critical="$(json_get '.update.critical' "$response")"
+  update_link="$(json_get '.update.update_link' "$response")"
+  notes_url="$(json_get '.update.notes_url' "$response")"
+  message="$(json_get '.message // .update.message' "$response")"
+
+  project_name="${project_name:-backupi}"
+  current_version="${current_version:-$APP_VERSION}"
+
+  case "$status" in
+    up_to_date)
+      set_update_status ok "Your version is up to date: $project_name $current_version"
+      [[ "$mode" == "startup" ]] && return 0
+      printf '%sUpdate check:%s %s is up to date (version %s).\n' "$C_GREEN" "$C_RESET" "$project_name" "$current_version"
+      ;;
+    update_available)
+      set_update_status update "Update available: $project_name ${latest_version:-unknown} (installed: $current_version)"
+      if [[ "$critical" == "true" ]]; then
+        printf '%s%sCritical update available:%s %s %s is available (installed: %s).\n' "$C_RED" "$C_BOLD" "$C_RESET" "$project_name" "${latest_version:-unknown}" "$current_version"
+      else
+        printf '%s%sNew update available:%s %s %s is available (installed: %s).\n' "$C_RED" "$C_BOLD" "$C_RESET" "$project_name" "${latest_version:-unknown}" "$current_version"
+      fi
+      [[ -n "$update_link" ]] && printf 'Update link: %s%s%s\n' "$C_BLUE" "$update_link" "$C_RESET"
+      [[ -n "$notes_url" ]] && printf 'Release notes: %s%s%s\n' "$C_BLUE" "$notes_url" "$C_RESET"
+      [[ -n "$message" ]] && printf '%s\n' "$message"
+      ;;
+    blocked)
+      set_update_status blocked "Update required: $project_name $current_version is no longer supported"
+      printf '%s%sUpdate required:%s %s version %s is no longer supported.\n' "$C_RED" "$C_BOLD" "$C_RESET" "$project_name" "$current_version"
+      [[ -n "$latest_version" ]] && printf 'Latest version: %s\n' "$latest_version"
+      [[ -n "$minimum_supported" ]] && printf 'Minimum supported: %s\n' "$minimum_supported"
+      [[ -n "$update_link" ]] && printf 'Update link: %s%s%s\n' "$C_BLUE" "$update_link" "$C_RESET"
+      [[ -n "$notes_url" ]] && printf 'Release notes: %s%s%s\n' "$C_BLUE" "$notes_url" "$C_RESET"
+      [[ -n "$message" ]] && printf '%s\n' "$message"
+      ;;
+    *)
+      set_update_status warning "Update status: unavailable (${message:-${status:-unknown response}})"
+      [[ "$mode" == "startup" ]] && return 0
+      printf '%sUpdate check unavailable:%s %s\n' "$C_YELLOW" "$C_RESET" "${message:-${status:-unknown response}}"
+      ;;
+  esac
+}
+
+check_updates() {
+  local mode="${1:-manual}"
+  local endpoint request_id instance_id payload response curl_status http_code body
+
+  if [[ -z "${UPDATE_API_KEY:-}" ]]; then
+    set_update_status warning "Update status: not configured"
+    [[ "$mode" == "startup" ]] && return 0
+    warn "Update API key is not configured. Expected config: $UPDATE_CONFIG_FILE"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    set_update_status warning "Update status: unavailable (curl is missing)"
+    [[ "$mode" == "startup" ]] && return 0
+    warn "curl is required for update checks."
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    set_update_status warning "Update status: unavailable (jq is missing)"
+    [[ "$mode" == "startup" ]] && return 0
+    warn "jq is required for update checks."
+    return 0
+  fi
+
+  detect_system
+  endpoint="${UPDATE_SERVER_URL%/}/api/updates/v1/updates/check"
+  request_id="$(generate_uuid)"
+  instance_id="$(get_update_instance_id)"
+  payload="$(build_update_payload "$instance_id")"
+
+  response="$(
+    curl -sS --max-time "$UPDATE_CHECK_TIMEOUT" \
+      -w $'\n%{http_code}' \
+      -X POST "$endpoint" \
+      -H "Authorization: Bearer $UPDATE_API_KEY" \
+      -H "Content-Type: application/json" \
+      -H "X-Request-ID: $request_id" \
+      -d "$payload"
+  )" || curl_status=$?
+  curl_status="${curl_status:-0}"
+
+  if [[ "$curl_status" != "0" ]]; then
+    set_update_status warning "Update status: unavailable (server not reachable)"
+    [[ "$mode" == "startup" ]] && return 0
+    warn "Update check failed while contacting update server."
+    return 0
+  fi
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ -z "$body" || ! "$http_code" =~ ^[0-9]+$ ]]; then
+    set_update_status warning "Update status: unavailable (invalid server response)"
+    [[ "$mode" == "startup" ]] && return 0
+    warn "Update check returned an invalid response."
+    return 0
+  fi
+
+  print_update_result "$body" "$mode"
+}
+
+maybe_check_updates_on_start() {
+  if ! config_bool_enabled "$UPDATE_CHECK_ON_START"; then
+    set_update_status warning "Update status: startup check disabled"
+    return 0
+  fi
+  check_updates startup || true
+}
+
+print_system_info() {
+  local detected_count
+  detect_system
+  detected_count="$(count_detected_items)"
+
+  printf 'Detected system\n'
+  printf 'OS: %s\n' "$DETECTED_OS_NAME"
+  printf 'OS ID: %s\n' "$DETECTED_OS_ID"
+  [[ -n "$DETECTED_OS_VERSION" ]] && printf 'Version ID: %s\n' "$DETECTED_OS_VERSION"
+  [[ -n "$DETECTED_OS_LIKE" ]] && printf 'ID like: %s\n' "$DETECTED_OS_LIKE"
+  printf 'Package managers/tools: %s\n' "$(join_words "${DETECTED_PACKAGE_MANAGERS[@]}")"
+  printf 'Current desktop session: %s\n' "$DETECTED_CURRENT_DESKTOP"
+  printf 'Detected desktop config families: %s\n' "$(join_words "${DETECTED_DESKTOP_CONFIGS[@]}")"
+  printf 'Configured entries available on this system: %s\n' "$detected_count"
+}
+
+make_parent() {
+  local path="$1"
+  local use_root="$2"
+  local parent
+  parent="$(dirname "$path")"
+  if [[ "$use_root" == "1" ]]; then
+    as_root mkdir -p "$parent"
+  else
+    run_cmd mkdir -p "$parent"
+  fi
+}
+
+make_dir() {
+  local path="$1"
+  local use_root="$2"
+  if [[ "$use_root" == "1" ]]; then
+    as_root mkdir -p "$path"
+  else
+    run_cmd mkdir -p "$path"
+  fi
+}
+
+rsync_copy_exact() {
+  local source="$1"
+  local target="$2"
+  local use_root="$3"
+  local rsync_args=(-aH)
+
+  if [[ "${BACKUP_RSYNC_DELETE:-false}" == "true" && -d "$source" ]]; then
+    rsync_args+=(--delete)
+  fi
+  if ((${#RSYNC_EXCLUDE_ARGS[@]} > 0)); then
+    rsync_args+=("${RSYNC_EXCLUDE_ARGS[@]}")
+    if [[ "${BACKUP_RSYNC_DELETE:-false}" == "true" && "${BACKUP_RSYNC_DELETE_EXCLUDED:-true}" == "true" && -d "$source" ]]; then
+      rsync_args+=(--delete-excluded)
+    fi
+  fi
+
+  if [[ -d "$source" ]]; then
+    make_dir "$target" "$use_root"
+    if [[ "$use_root" == "1" ]]; then
+      as_root rsync "${rsync_args[@]}" "$source/" "$target/"
+    else
+      run_cmd rsync "${rsync_args[@]}" "$source/" "$target/"
+    fi
+  elif [[ -f "$source" ]]; then
+    make_parent "$target" "$use_root"
+    if [[ "$use_root" == "1" ]]; then
+      as_root rsync "${rsync_args[@]}" "$source" "$target"
+    else
+      run_cmd rsync "${rsync_args[@]}" "$source" "$target"
+    fi
+  else
+    warn "Skipping missing path: $source"
+  fi
+}
+
+restore_snapshot_target() {
+  local target="$1"
+  local ts="$2"
+  local snapshot
+  local rel
+  RSYNC_EXCLUDE_ARGS=()
+
+  [[ "${BACKUP_BEFORE_RESTORE:-true}" == "true" ]] || return 0
+  [[ -e "$target" ]] || return 0
+
+  rel="${target#/}"
+  snapshot="$BACKUP_ROOT/pre-restore-snapshots/$ts/$rel"
+  info "Saving current target before overwrite: $target"
+  if path_needs_root "$target"; then
+    rsync_copy_exact "$target" "$snapshot" 1
+  else
+    rsync_copy_exact "$target" "$snapshot" 0
+  fi
+}
+
+backup_dnf_packages() {
+  local output="$CURRENT_ROOT/$ITEM_BACKUP_PATH"
+  make_parent "$output" 0
+
+  if ! command -v dnf >/dev/null 2>&1; then
+    warn "dnf not found; skipping $ITEM_ID"
+    return 0
+  fi
+
+  info "Writing DNF package list: $output"
+  if (( DRY_RUN )); then
+    printf '[dry-run] dnf repoquery --userinstalled > %q\n' "$output"
+  else
+    dnf repoquery --userinstalled > "$output"
+  fi
+}
+
+backup_flatpak_apps() {
+  local output="$CURRENT_ROOT/$ITEM_BACKUP_PATH"
+  make_parent "$output" 0
+
+  if ! command -v flatpak >/dev/null 2>&1; then
+    warn "flatpak not found; skipping $ITEM_ID"
+    return 0
+  fi
+
+  info "Writing Flatpak app list: $output"
+  if (( DRY_RUN )); then
+    printf '[dry-run] flatpak list --app --columns=application > %q\n' "$output"
+  else
+    flatpak list --app --columns=application > "$output"
+  fi
+}
+
+backup_backupi_config() {
+  local target="$CURRENT_ROOT/$BACKUPI_SELF_CONFIG_BACKUP_PATH"
+  local root_copy=0
+
+  [[ -r "$CONFIG_FILE" ]] || { warn "Skipping unreadable backupi config: $CONFIG_FILE"; return 0; }
+  RSYNC_EXCLUDE_ARGS=()
+  path_needs_root "$CONFIG_FILE" && root_copy=1
+  info "Backing up [safe/backupi] backupi-config"
+  rsync_copy_exact "$CONFIG_FILE" "$target" "$root_copy"
+}
+
+backup_item() {
+  parse_item "$1"
+
+  case "$ITEM_KIND" in
+    dnf-packages) backup_dnf_packages ;;
+    flatpak-apps) backup_flatpak_apps ;;
+    file|dir)
+      local target="$CURRENT_ROOT/$ITEM_BACKUP_PATH"
+      local root_copy=0
+      build_rsync_exclude_args
+      path_needs_root "$ITEM_SOURCE" && root_copy=1
+      info "Backing up [$ITEM_CATEGORY/$ITEM_GROUP] $ITEM_ID"
+      rsync_copy_exact "$ITEM_SOURCE" "$target" "$root_copy"
+      ;;
+    *)
+      warn "Unknown item kind '$ITEM_KIND' for $ITEM_ID"
+      ;;
+  esac
+}
+
+restore_dnf_packages() {
+  local input="$RESTORE_SOURCE_ROOT/$ITEM_BACKUP_PATH"
+  local packages=()
+
+  [[ -f "$input" ]] || { warn "Missing package list: $input"; return 0; }
+  mapfile -t packages < <(grep -Ev '^[[:space:]]*(#|$)' "$input" || true)
+  ((${#packages[@]} > 0)) || { warn "No packages listed in $input"; return 0; }
+
+  info "DNF packages to install: ${#packages[@]}"
+  yes_no "Install listed DNF packages with sudo dnf install?" n || return 0
+  as_root dnf install -y "${packages[@]}"
+}
+
+restore_flatpak_apps() {
+  local input="$RESTORE_SOURCE_ROOT/$ITEM_BACKUP_PATH"
+  local apps=()
+
+  [[ -f "$input" ]] || { warn "Missing Flatpak list: $input"; return 0; }
+  mapfile -t apps < <(grep -Ev '^[[:space:]]*(#|$)' "$input" || true)
+  ((${#apps[@]} > 0)) || { warn "No Flatpak apps listed in $input"; return 0; }
+
+  info "Flatpak apps to install: ${#apps[@]}"
+  yes_no "Install listed Flatpak apps from Flathub?" n || return 0
+  run_cmd flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+  run_cmd flatpak install -y flathub "${apps[@]}"
+}
+
+restore_item() {
+  local raw="$1"
+  local ts="${2:-$(date +%Y%m%d-%H%M%S)}"
+  validate_backup_root
+  parse_item "$raw"
+
+  case "$ITEM_KIND" in
+    dnf-packages) restore_dnf_packages ;;
+    flatpak-apps) restore_flatpak_apps ;;
+    file|dir)
+      local source="$RESTORE_SOURCE_ROOT/$ITEM_BACKUP_PATH"
+      local target="$ITEM_RESTORE_TARGET"
+      local root_copy=0
+      RSYNC_EXCLUDE_ARGS=()
+
+      [[ -e "$source" ]] || { warn "Skipping missing backup path: $source"; return 0; }
+      path_needs_root "$target" && root_copy=1
+
+      info "Restoring [$ITEM_CATEGORY/$ITEM_GROUP] $ITEM_ID"
+      restore_snapshot_target "$target" "$ts"
+      rsync_copy_exact "$source" "$target" "$root_copy"
+      ;;
+    *)
+      warn "Unknown item kind '$ITEM_KIND' for $ITEM_ID"
+      ;;
+  esac
+}
+
+restore_backupi_config() {
+  local source target ts active_backup_root root_copy=0
+
+  validate_backup_root
+  active_backup_root="$BACKUP_ROOT"
+  source="$RESTORE_SOURCE_ROOT/$BACKUPI_SELF_CONFIG_BACKUP_PATH"
+  target="$CONFIG_FILE"
+
+  [[ -f "$source" ]] || { warn "Missing backupi config backup: $source"; return 0; }
+
+  printf 'Source: %s\n' "$source"
+  printf 'Target: %s\n' "$target"
+  warn "This overwrites the active backupi configuration. Restore only from your own trusted backup."
+  yes_no "Restore backupi configuration now?" n || return 0
+
+  ts="$(date +%Y%m%d-%H%M%S)"
+  RSYNC_EXCLUDE_ARGS=()
+  restore_snapshot_target "$target" "$ts"
+  path_needs_root "$target" && root_copy=1
+  rsync_copy_exact "$source" "$target" "$root_copy"
+  BACKUP_ROOT="$active_backup_root"
+  write_config_backup_root "$active_backup_root"
+  load_config
+  info "backupi configuration restored and reloaded."
+  info "Current backup destination preserved: $BACKUP_ROOT"
+}
+
+latest_snapshot_dir() {
+  [[ -d "$SNAPSHOT_PARENT" ]] || return 0
+  find "$SNAPSHOT_PARENT" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp-*' -printf '%p\n' 2>/dev/null | sort | tail -n 1
+}
+
+snapshot_copy_exact() {
+  local source="$1"
+  local target="$2"
+  local previous="$3"
+  local use_root="$4"
+  local rsync_args=(-aH --delete)
+
+  if [[ -d "$source" ]]; then
+    [[ -n "$previous" && -d "$previous" ]] && rsync_args+=(--link-dest="$previous")
+    if [[ "$use_root" == "1" ]]; then
+      as_root mkdir -p "$target"
+      as_root rsync "${rsync_args[@]}" "$source/" "$target/"
+    else
+      run_cmd mkdir -p "$target"
+      run_cmd rsync "${rsync_args[@]}" "$source/" "$target/"
+    fi
+  elif [[ -f "$source" ]]; then
+    [[ -n "$previous" && -f "$previous" ]] && rsync_args+=(--link-dest="$(dirname "$previous")")
+    if [[ "$use_root" == "1" ]]; then
+      as_root mkdir -p "$(dirname "$target")"
+      as_root rsync "${rsync_args[@]}" "$source" "$target"
+    else
+      run_cmd mkdir -p "$(dirname "$target")"
+      run_cmd rsync "${rsync_args[@]}" "$source" "$target"
+    fi
+  fi
+}
+
+create_snapshot() {
+  local snapshot_name snapshot_tmp snapshot_final previous raw source target previous_path use_root snapshotted=0 root_snapshot=0
+  local items=("$@")
+
+  if ((${#items[@]} == 0)); then
+    items=("${BACKUPI_ITEMS[@]}")
+  fi
+
+  config_bool_enabled "$BACKUP_SNAPSHOTS_ENABLED" || return 0
+  if [[ ! -d "$CURRENT_ROOT" ]]; then
+    if (( DRY_RUN )); then
+      info "Snapshot creation skipped in dry-run because current backup is not created."
+    else
+      warn "Current backup root missing; snapshot skipped: $CURRENT_ROOT"
+    fi
+    return 0
+  fi
+
+  snapshot_name="$(date +%Y%m%d-%H%M%S)"
+  snapshot_tmp="$SNAPSHOT_PARENT/.tmp-$snapshot_name"
+  snapshot_final="$SNAPSHOT_PARENT/$snapshot_name"
+  if [[ -e "$snapshot_final" || -e "$snapshot_tmp" ]]; then
+    snapshot_name="$snapshot_name-$$"
+    snapshot_tmp="$SNAPSHOT_PARENT/.tmp-$snapshot_name"
+    snapshot_final="$SNAPSHOT_PARENT/$snapshot_name"
+  fi
+
+  previous="$(latest_snapshot_dir || true)"
+  info "Creating snapshot: $snapshot_final"
+  run_cmd mkdir -p "$SNAPSHOT_PARENT"
+  if [[ -e "$snapshot_tmp" ]]; then
+    if [[ -w "$snapshot_tmp" || -w "$(dirname "$snapshot_tmp")" ]]; then
+      run_cmd rm -rf "$snapshot_tmp"
+    else
+      as_root rm -rf "$snapshot_tmp"
+    fi
+  fi
+  run_cmd mkdir -p "$snapshot_tmp"
+
+  for raw in "${items[@]}"; do
+    parse_item "$raw"
+    item_is_snapshotted || continue
+    [[ -n "$ITEM_BACKUP_PATH" ]] || continue
+
+    source="$CURRENT_ROOT/$ITEM_BACKUP_PATH"
+    [[ -e "$source" ]] || continue
+    target="$snapshot_tmp/$ITEM_BACKUP_PATH"
+    previous_path=""
+    [[ -n "$previous" ]] && previous_path="$previous/$ITEM_BACKUP_PATH"
+    use_root=0
+    if path_needs_root "$ITEM_SOURCE" || [[ ! -r "$source" ]]; then
+      use_root=1
+      root_snapshot=1
+    fi
+
+    info "Snapshotting [$ITEM_SNAPSHOT_POLICY] $ITEM_ID"
+    snapshot_copy_exact "$source" "$target" "$previous_path" "$use_root"
+    snapshotted=1
+  done
+
+  source="$CURRENT_ROOT/$BACKUPI_SELF_CONFIG_BACKUP_PATH"
+  if [[ -f "$source" ]]; then
+    target="$snapshot_tmp/$BACKUPI_SELF_CONFIG_BACKUP_PATH"
+    previous_path=""
+    [[ -n "$previous" ]] && previous_path="$previous/$BACKUPI_SELF_CONFIG_BACKUP_PATH"
+    use_root=0
+    if [[ ! -r "$source" ]]; then
+      use_root=1
+      root_snapshot=1
+    fi
+
+    info "Snapshotting [snapshot] backupi-config"
+    snapshot_copy_exact "$source" "$target" "$previous_path" "$use_root"
+    snapshotted=1
+  fi
+
+  if (( snapshotted )); then
+    if (( root_snapshot )); then
+      as_root mv "$snapshot_tmp" "$snapshot_final"
+    else
+      run_cmd mv "$snapshot_tmp" "$snapshot_final"
+    fi
+  else
+    if (( root_snapshot )); then
+      as_root rm -rf "$snapshot_tmp"
+    else
+      run_cmd rm -rf "$snapshot_tmp"
+    fi
+    warn "No snapshot entries existed in current backup; snapshot skipped."
+  fi
+}
+
+cleanup_snapshots() {
+  local snapshots=()
+  local count remove_count i
+
+  config_bool_enabled "$BACKUP_SNAPSHOTS_ENABLED" || return 0
+  [[ -d "$SNAPSHOT_PARENT" ]] || return 0
+  mapfile -t snapshots < <(find "$SNAPSHOT_PARENT" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp-*' -printf '%p\n' 2>/dev/null | sort)
+  count="${#snapshots[@]}"
+  (( count > BACKUP_SNAPSHOT_RETENTION )) || return 0
+  remove_count=$((count - BACKUP_SNAPSHOT_RETENTION))
+
+  info "Removing old snapshots: $remove_count"
+  for ((i = 0; i < remove_count; i++)); do
+    as_root rm -rf "${snapshots[$i]}"
+  done
+}
+
+run_backup_items() {
+  local label="$1"
+  shift
+  local items=("$@")
+  local raw
+
+  command -v rsync >/dev/null 2>&1 || die "rsync is required"
+  validate_backup_root
+  info "Backup root: $BACKUP_ROOT"
+  info "Current backup: $CURRENT_ROOT"
+  info "Backup selection: $label"
+  info "Entries selected: ${#items[@]}"
+  run_cmd mkdir -p "$CURRENT_ROOT"
+
+  backup_backupi_config
+  for raw in "${items[@]}"; do
+    backup_item "$raw"
+  done
+
+  create_snapshot "${items[@]}"
+  cleanup_snapshots
+  info "Backup finished."
+}
+
+run_backup_all() {
+  run_backup_items "all configured entries" "${BACKUPI_ITEMS[@]}"
+}
+
+run_backup_detected() {
+  local selected=()
+  local raw
+
+  detect_system
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    parse_item "$raw"
+    if item_matches_detected_system; then
+      selected+=("$raw")
+    fi
+  done
+
+  ((${#selected[@]} > 0)) || { warn "No configured entries matched the detected system."; return 0; }
+  run_backup_items "detected entries only" "${selected[@]}"
+}
+
+restore_matching() {
+  local category="$1"
+  local group="$2"
+  local include_packages="${3:-0}"
+  local label="$4"
+  local ts
+  local selected=()
+
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    parse_item "$raw"
+    [[ "$ITEM_CATEGORY" == "$category" ]] || continue
+    [[ "$group" == "*" || "$ITEM_GROUP" == "$group" ]] || continue
+    if [[ "$include_packages" != "1" ]] && is_package_item "$ITEM_KIND"; then
+      continue
+    fi
+    selected+=("$raw")
+  done
+
+  ((${#selected[@]} > 0)) || { warn "No matching entries for $label"; return 0; }
+
+  info "$label"
+  printf 'Entries: %s\n' "${#selected[@]}"
+  yes_no "Continue restore?" n || return 0
+
+  ts="$(date +%Y%m%d-%H%M%S)"
+  for raw in "${selected[@]}"; do
+    restore_item "$raw" "$ts"
+  done
+}
+
+restore_packages() {
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    parse_item "$raw"
+    is_package_item "$ITEM_KIND" || continue
+    restore_item "$raw" "$ts"
+  done
+}
+
+print_item_line() {
+  parse_item "$1"
+  printf '%-15s %-12s %-16s %-24s %-12s %s\n' "$ITEM_CATEGORY" "$ITEM_KIND" "$ITEM_GROUP" "$ITEM_ID" "$ITEM_SNAPSHOT_POLICY" "$ITEM_DESCRIPTION"
+}
+
+list_items() {
+  printf 'Config: %s\n' "$CONFIG_FILE"
+  printf 'Backup root: %s\n' "$(display_value "$BACKUP_ROOT")"
+  printf 'Current backup: %s\n' "$(display_value "$CURRENT_ROOT")"
+  printf 'Restore source: %s\n' "$(display_value "$RESTORE_SOURCE_ROOT")"
+  printf 'backupi config backup: %s\n' "$(display_value "$BACKUPI_SELF_CONFIG_BACKUP_PATH")"
+  printf 'Snapshot retention: %s\n\n' "$BACKUP_SNAPSHOT_RETENTION"
+  printf '%-15s %-12s %-16s %-24s %-12s %s\n' 'Category' 'Kind' 'Group' 'ID' 'Snapshot' 'Description'
+  printf '%-15s %-12s %-16s %-24s %-12s %s\n' '--------' '----' '-----' '--' '--------' '-----------'
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    print_item_line "$raw"
+  done
+}
+
+choose_single_restore() {
+  local category="$1"
+  local selected=()
+  local choice raw
+
+  for raw in "${BACKUPI_ITEMS[@]}"; do
+    parse_item "$raw"
+    [[ "$ITEM_CATEGORY" == "$category" ]] || continue
+    is_path_item "$ITEM_KIND" || continue
+    selected+=("$raw")
+  done
+
+  ((${#selected[@]} > 0)) || { warn "No $category path entries configured."; return 0; }
+
+  while true; do
+    printf '\n%s entries\n' "$category"
+    local i=1
+    for raw in "${selected[@]}"; do
+      parse_item "$raw"
+      printf '%2d) %-16s %-24s %s\n' "$i" "$ITEM_GROUP" "$ITEM_ID" "$ITEM_DESCRIPTION"
+      ((i++))
+    done
+    printf ' b) Back\n'
+    printf 'Choose entry: '
+    read -r choice
+    [[ "$choice" == "b" ]] && return 0
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    (( choice >= 1 && choice <= ${#selected[@]} )) || continue
+
+    raw="${selected[$((choice - 1))]}"
+    parse_item "$raw"
+    printf '\nSelected: %s\nSource backup: %s/%s\nTarget: %s\n' "$ITEM_DESCRIPTION" "$RESTORE_SOURCE_ROOT" "$ITEM_BACKUP_PATH" "$ITEM_RESTORE_TARGET"
+    if [[ "$ITEM_CATEGORY" == "risky" ]]; then
+      warn "This entry is marked risky. Restore it only when you really need it."
+    fi
+    yes_no "Restore this entry now?" n && restore_item "$raw"
+  done
+}
+
+edit_config() {
+  local editor="${EDITOR:-nano}"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    run_cmd "$editor" "$CONFIG_FILE"
+  else
+    run_cmd sudoedit "$CONFIG_FILE"
+  fi
+}
+
+write_config_assignment() {
+  local key="$1"
+  local value="$2"
+  local quoted tmp
+
+  [[ "$key" =~ ^[A-Z0-9_]+$ ]] || die "Invalid config key: $key"
+  [[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE"
+
+  printf -v quoted '%q' "$value"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v line="$key=$quoted" '
+    BEGIN { done = 0 }
+    $0 ~ "^[[:space:]]*" key "=" && done == 0 {
+      print line
+      done = 1
+      next
+    }
+    { print }
+    END {
+      if (done == 0) {
+        print ""
+        print line
+      }
+    }
+  ' "$CONFIG_FILE" > "$tmp"
+
+  if [[ ${EUID:-$(id -u)} -eq 0 || -w "$CONFIG_FILE" ]]; then
+    run_cmd install -m 0644 "$tmp" "$CONFIG_FILE"
+  else
+    as_root install -m 0644 "$tmp" "$CONFIG_FILE"
+  fi
+  rm -f "$tmp"
+}
+
+write_config_backup_root() {
+  local new_root="$1"
+  local error
+  if error="$(backup_root_value_validation_error "$new_root")"; then
+    die "$error"
+  fi
+  write_config_assignment "BACKUP_ROOT" "$new_root"
+}
+
+set_backup_root() {
+  local new_root="${1:-}"
+  local from_argument=0
+  local error
+
+  if [[ -z "$new_root" ]]; then
+    printf 'Current backup destination: %s\n' "$(display_value "$BACKUP_ROOT")"
+    while true; do
+      printf 'New backup destination: '
+      read -r new_root
+      [[ -n "$new_root" ]] || { warn "No backup destination entered."; return 0; }
+      new_root="$(expand_user_path "$new_root")"
+      if ! error="$(backup_root_value_validation_error "$new_root")"; then
+        break
+      fi
+      warn "$error"
+    done
+  else
+    from_argument=1
+    [[ -n "$new_root" ]] || { warn "No backup destination entered."; return 0; }
+    new_root="$(expand_user_path "$new_root")"
+    if error="$(backup_root_value_validation_error "$new_root")"; then
+      die "$error"
+    fi
+  fi
+
+  printf 'Set backup destination to: %s\n' "$new_root"
+  if (( ! from_argument )); then
+    yes_no "Update $CONFIG_FILE?" n || return 0
+  fi
+  write_config_backup_root "$new_root"
+  BACKUP_ROOT="$new_root"
+  CURRENT_ROOT="$(backup_current_root)"
+  SNAPSHOT_PARENT="$(snapshot_parent_root)"
+  RESTORE_SOURCE_ROOT="$(default_restore_root)"
+  if (( DRY_RUN )); then
+    info "Backup destination would be updated."
+  else
+    info "Backup destination updated."
+  fi
+}
+
+set_snapshot_retention() {
+  local retention="${1:-}"
+  local from_argument=0
+
+  if [[ -z "$retention" ]]; then
+    printf 'Current snapshot retention: %s\n' "$BACKUP_SNAPSHOT_RETENTION"
+    printf 'Keep how many snapshots? '
+    read -r retention
+  else
+    from_argument=1
+  fi
+
+  [[ "$retention" =~ ^[0-9]+$ ]] || { warn "Please enter a number."; return 0; }
+  printf 'Set snapshot retention to: %s\n' "$retention"
+  if (( ! from_argument )); then
+    yes_no "Update $CONFIG_FILE?" n || return 0
+  fi
+  write_config_assignment "BACKUP_SNAPSHOT_RETENTION" "$retention"
+  BACKUP_SNAPSHOT_RETENTION="$retention"
+  if (( DRY_RUN )); then
+    info "Snapshot retention would be updated."
+  else
+    info "Snapshot retention updated."
+  fi
+}
+
+config_menu() {
+  while true; do
+    cat <<EOF
+
+Configuration
+Config file: $CONFIG_FILE
+Backup destination: $(display_value "$BACKUP_ROOT")
+Snapshot retention: $BACKUP_SNAPSHOT_RETENTION
+
+1) Set backup destination
+2) Set snapshot retention
+3) Edit sources, backup paths and restore targets
+4) List configured entries
+5) Back
+EOF
+    printf 'Choose option: '
+    read -r choice
+    case "$choice" in
+      1) set_backup_root ; pause ;;
+      2) set_snapshot_retention ; pause ;;
+      3) edit_config ; load_config ; pause ;;
+      4) list_items ; pause ;;
+      5|b|B) return 0 ;;
+    esac
+  done
+}
+
+choose_restore_source() {
+  local choices=()
+  local choice snapshot
+
+  validate_backup_root
+  choices+=("$CURRENT_ROOT")
+  if [[ -d "$SNAPSHOT_PARENT" ]]; then
+    while IFS= read -r snapshot; do
+      choices+=("$snapshot")
+    done < <(find "$SNAPSHOT_PARENT" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp-*' -printf '%p\n' 2>/dev/null | sort -r)
+  fi
+
+  while true; do
+    printf '\nRestore source\n'
+    local i=1
+    for snapshot in "${choices[@]}"; do
+      if [[ "$snapshot" == "$CURRENT_ROOT" ]]; then
+        printf '%2d) current - %s\n' "$i" "$snapshot"
+      else
+        printf '%2d) snapshot - %s\n' "$i" "$(basename "$snapshot")"
+      fi
+      ((i++))
+    done
+    printf ' b) Back\n'
+    printf 'Choose restore source: '
+    read -r choice
+    [[ "$choice" == "b" ]] && return 0
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    (( choice >= 1 && choice <= ${#choices[@]} )) || continue
+    RESTORE_SOURCE_ROOT="${choices[$((choice - 1))]}"
+    info "Restore source set to: $RESTORE_SOURCE_ROOT"
+    return 0
+  done
+}
+
+restore_menu() {
+  while true; do
+    cat <<EOF
+
+Restore menu
+Restore source: $(display_value "$RESTORE_SOURCE_ROOT")
+
+1) Restore backupi configuration
+2) Restore recommended safe user entries
+3) Restore packages and Flatpaks
+4) Choose one safe entry
+5) Choose one risky entry
+6) Choose restore source
+7) Restore all safe entries, including safe /etc entries
+8) Back
+EOF
+    printf 'Choose option: '
+    read -r choice
+    case "$choice" in
+      1) restore_backupi_config ; pause ;;
+      2) restore_matching safe user-safe 0 "Recommended safe user restore" ; pause ;;
+      3) restore_packages ; pause ;;
+      4) choose_single_restore safe ;;
+      5) choose_single_restore risky ;;
+      6) choose_restore_source ; pause ;;
+      7)
+        warn "This can overwrite /etc configuration such as repos, dnf, modprobe and sysctl."
+        restore_matching safe "*" 0 "All safe path entries"
+        pause
+        ;;
+      8|b|B) return 0 ;;
+    esac
+  done
+}
+
+setup_menu() {
+  local choice root_error
+
+  while ! backup_root_is_valid; do
+    root_error="$(backup_root_validation_error || true)"
+    cat <<EOF
+
+backupi setup
+$(print_update_status_line)
+Backup root: $(display_value "$BACKUP_ROOT")
+
+A backup destination is required before backup and restore actions are available.
+$root_error
+
+1) Set backup destination
+2) System info / detection
+3) List configured entries
+4) Edit config
+5) Credits
+6) Quit
+EOF
+    printf 'Choose option: '
+    read -r choice
+    case "$choice" in
+      1) set_backup_root ; pause ;;
+      2) print_system_info ; pause ;;
+      3) list_items ; pause ;;
+      4) edit_config ; load_config ; pause ;;
+      5) print_credits ; pause ;;
+      6|q|Q) exit 0 ;;
+    esac
+  done
+}
+
+main_menu() {
+  while true; do
+    cat <<EOF
+
+backupi
+$(print_update_status_line)
+Backup root: $(display_value "$BACKUP_ROOT")
+
+1) Run backup for all configured entries
+2) Run backup for detected entries only
+3) Restore
+4) System info / detection
+5) List configured entries
+6) Configuration
+7) Credits
+8) Quit
+EOF
+    printf 'Choose option: '
+    read -r choice
+    case "$choice" in
+      1) run_backup_all ; pause ;;
+      2) run_backup_detected ; pause ;;
+      3) restore_menu ;;
+      4) print_system_info ; pause ;;
+      5) list_items ; pause ;;
+      6) config_menu ;;
+      7) print_credits ; pause ;;
+      8|q|Q) exit 0 ;;
+    esac
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backup) COMMAND="backup"; shift ;;
+    --backup-detected) COMMAND="backup-detected"; shift ;;
+    --check-updates) COMMAND="check-updates"; shift ;;
+    --system-info) COMMAND="system-info"; shift ;;
+    --restore-safe) COMMAND="restore-safe"; shift ;;
+    --restore-packages) COMMAND="restore-packages"; shift ;;
+    --restore-backupi-config) COMMAND="restore-backupi-config"; shift ;;
+    --list) COMMAND="list"; shift ;;
+    --edit-config) COMMAND="edit-config"; shift ;;
+    --set-backup-root)
+      [[ $# -ge 2 ]] || die "--set-backup-root needs a directory"
+      COMMAND="set-backup-root"
+      NEW_BACKUP_ROOT="$2"
+      shift 2
+      ;;
+    --set-snapshot-retention)
+      [[ $# -ge 2 ]] || die "--set-snapshot-retention needs a number"
+      COMMAND="set-snapshot-retention"
+      NEW_SNAPSHOT_RETENTION="$2"
+      shift 2
+      ;;
+    --config)
+      [[ $# -ge 2 ]] || die "--config needs a file"
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --version) print_credits; exit 0 ;;
+    --credits) print_credits; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+setup_colors
+load_config
+load_update_config
+
+case "$COMMAND" in
+  backup) run_backup_all ;;
+  backup-detected) run_backup_detected ;;
+  check-updates) check_updates manual ;;
+  system-info) print_system_info ;;
+  restore-safe) restore_matching safe user-safe 0 "Recommended safe user restore" ;;
+  restore-packages) restore_packages ;;
+  restore-backupi-config) restore_backupi_config ;;
+  list) list_items ;;
+  edit-config) edit_config ;;
+  set-backup-root) set_backup_root "$NEW_BACKUP_ROOT" ;;
+  set-snapshot-retention) set_snapshot_retention "$NEW_SNAPSHOT_RETENTION" ;;
+  menu) maybe_check_updates_on_start ; setup_menu ; main_menu ;;
+esac

@@ -1,0 +1,14 @@
+# backupi update center configuration overrides
+#
+# backupi has a built-in public project API key for update checks.
+# Copy this file to /etc/backupi/update.conf only if you want to override
+# update settings such as channel, timeout or server URL.
+
+UPDATE_SERVER_URL="https://update.gerald-hasani.com"
+UPDATE_PROJECT_ID="backupi"
+UPDATE_CHANNEL="stable"
+
+# Check once when the interactive menu starts. Network or API errors do not
+# block backupi.
+UPDATE_CHECK_ON_START="true"
+UPDATE_CHECK_TIMEOUT="5"
